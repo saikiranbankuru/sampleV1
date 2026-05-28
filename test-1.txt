@@ -1,0 +1,235 @@
+logservices
+
+import { lokiApiClient } from './apiClient';
+import type { LokiQueryResponse, LokiStream } from '@/types/log';
+import type { TicketMapping, AgentRun, CaseWorked, Incident, TicketStatus, AgentStatus } from '@/types/dashboard';
+
+// Simple LogQL that matches the working API endpoint shown in the dashboard
+const LOGQL = '{service_name="Digital-Agent"}';
+
+interface LogQueryParams {
+  logql: string;
+  lookback_seconds: number;
+  limit: number;
+  direction: 'backward' | 'forward';
+}
+
+const DEFAULT_PARAMS: LogQueryParams = {
+  logql: LOGQL,
+  lookback_seconds: 3600,
+  limit: 50,
+  direction: 'backward',
+};
+
+export interface LokiDashboardData {
+  tickets: TicketMapping[];
+  agentRuns: AgentRun[];
+  casesWorked: CaseWorked[];
+  incidents: Incident[];
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/** Convert nanosecond timestamp string to milliseconds. */
+const nsToMs = (ns: string): number => Math.floor(Number(ns) / 1_000_000);
+
+/**
+ * Extract a timestamp string from a stream's log entries.
+ * Tries to parse the JSON log line first; falls back to timestamp_ns.
+ */
+const getStreamTimestamp = (stream: LokiStream): string => {
+  for (const entry of stream.logs) {
+    try {
+      const parsed = JSON.parse(entry.log) as Record<string, unknown>;
+      if (typeof parsed.timestamp === 'string') return parsed.timestamp;
+    } catch {
+      // log is not valid JSON — continue to next entry
+    }
+  }
+  const first = stream.logs[0];
+  if (first) return new Date(nsToMs(first.timestamp_ns)).toISOString();
+  return new Date().toISOString();
+};
+
+/** Format a timestamp as DD-MM-YY. Handles both ISO and "YYYY-MM-DD HH:MM:SS" formats. */
+const toDateString = (ts: string): string => {
+  const d = new Date(ts.replace(' ', 'T'));
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const yy = String(d.getFullYear()).slice(-2);
+  return `${dd}-${mm}-${yy}`;
+};
+
+/** Convert a timestamp to a human-readable relative time ("2 days ago", etc.). */
+const toTimeAgo = (ts: string): string => {
+  const diffMs = Date.now() - new Date(ts.replace(' ', 'T')).getTime();
+  const mins = Math.floor(diffMs / 60_000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min${mins === 1 ? '' : 's'} ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hr${hrs === 1 ? '' : 's'} ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
+};
+
+/**
+ * Derive ticket status from all streams that belong to one case number.
+ *
+ * Rules (checked in priority order):
+ *  1. Any stream with level "error" OR a log message containing "workflow failed" / "workflow stopped" → failed
+ *  2. Any log message containing "workflow completed" / "accuracy evaluation completed" → resolved
+ *  3. Anything else → processing
+ */
+const deriveStatus = (streams: LokiStream[]): TicketStatus => {
+  let hasError = false;
+  let hasResolved = false;
+
+  for (const stream of streams) {
+    const level = (
+      stream.stream_labels.detected_level ??
+      stream.stream_labels.level ??
+      'info'
+    ).toLowerCase();
+
+    if (level === 'error') hasError = true;
+
+    for (const entry of stream.logs) {
+      try {
+        const parsed = JSON.parse(entry.log) as Record<string, unknown>;
+        const msg = String(parsed.message ?? '').toLowerCase();
+        if (msg.includes('workflow completed') || msg.includes('accuracy evaluation completed')) {
+          hasResolved = true;
+        }
+        if (msg.includes('workflow failed') || msg.includes('workflow stopped')) {
+          hasError = true;
+        }
+      } catch {
+        // log line is not valid JSON — skip silently
+      }
+    }
+  }
+
+  if (hasError) return 'failed';
+  if (hasResolved) return 'resolved';
+  return 'processing';
+};
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+export const fetchLokiDashboardData = async (
+  params: Partial<LogQueryParams> = {},
+): Promise<LokiDashboardData> => {
+  const response = await lokiApiClient.get<LokiQueryResponse>('/query', {
+    params: { ...DEFAULT_PARAMS, ...params },
+  });
+
+  // response is already the parsed JSON body (apiClient unwraps axios response.data)
+  const streams: LokiStream[] = response.data?.streams ?? [];
+
+  // Group all streams by case_number for per-ticket aggregation
+  const byCaseNumber = new Map<string, LokiStream[]>();
+  for (const stream of streams) {
+    const key = stream.stream_labels.case_number ?? 'UNKNOWN';
+    if (!byCaseNumber.has(key)) byCaseNumber.set(key, []);
+    byCaseNumber.get(key)!.push(stream);
+  }
+
+  const caseEntries = Array.from(byCaseNumber.entries());
+
+  // -----------------------------------------------------------------------
+  // Ticket to Agent Mapping — one row per unique case_number, max 8
+  // -----------------------------------------------------------------------
+  const tickets: TicketMapping[] = caseEntries.slice(0, 8).map(([caseNum, caseStreams], i) => ({
+    id: String(i + 1),
+    ticketNo: caseNum,
+    agentName: caseStreams[0].stream_labels.service_name ?? 'Digital-Agent',
+    agentId: String(i + 1),
+    status: deriveStatus(caseStreams),
+  }));
+
+  // -----------------------------------------------------------------------
+  // Agents & Last Run — one row per unique case_number (workflow run), max 5
+  // -----------------------------------------------------------------------
+  const agentRuns: AgentRun[] = caseEntries.slice(0, 5).map(([, caseStreams], i) => {
+    const ts = getStreamTimestamp(caseStreams[0]);
+    const status = deriveStatus(caseStreams);
+    return {
+      id: String(i + 1),
+      name: caseStreams[0].stream_labels.service_name ?? 'Digital-Agent',
+      date: toDateString(ts),
+      lastRunAgo: toTimeAgo(ts),
+      status: (status === 'failed' ? 'inactive' : 'active') as AgentStatus,
+    };
+  });
+
+  // -----------------------------------------------------------------------
+  // Number of Cases Worked — stream count per service name
+  // -----------------------------------------------------------------------
+  const caseCounts = new Map<string, number>();
+  for (const stream of streams) {
+    const svc = stream.stream_labels.service_name ?? 'Digital-Agent';
+    caseCounts.set(svc, (caseCounts.get(svc) ?? 0) + 1);
+  }
+  const casesWorked: CaseWorked[] = Array.from(caseCounts.entries()).map(([agentName, count], i) => ({
+    id: String(i + 1),
+    agentName,
+    count,
+  }));
+
+  // -----------------------------------------------------------------------
+  // Incidents — streams with level "error" only
+  // -----------------------------------------------------------------------
+  const incidents: Incident[] = streams
+    .filter(s => (s.stream_labels.level ?? 'info').toLowerCase() === 'error')
+    .map((stream, i) => ({
+      id: String(i + 1),
+      agentName: stream.stream_labels.service_name ?? 'Digital-Agent',
+      caseNumber: stream.stream_labels.case_number ?? 'UNKNOWN',
+    }));
+
+  return { tickets, agentRuns, casesWorked, incidents };
+};
+
+------------------------------------------
+log
+
+
+// Labels indexed by Loki — usable in LogQL selectors
+export interface LokiStreamLabels {
+  agent?: string;
+  case_number?: string;
+  detected_level?: string;
+  level?: string;
+  service_name?: string;
+}
+
+// A single raw log line inside a stream
+export interface LokiRawLog {
+  timestamp_ns: string;
+  log: string; // JSON-encoded string
+}
+
+// One Loki stream = unique label combination + its log lines
+export interface LokiStream {
+  stream_labels: LokiStreamLabels;
+  logs: LokiRawLog[];
+}
+
+// The data envelope returned by /api/logs/query
+export interface LokiQueryData {
+  query: string;
+  total_streams: number;
+  total_logs: number;
+  streams: LokiStream[];
+}
+
+// Top-level response from the backend API
+export interface LokiQueryResponse {
+  success: boolean;
+  message: string;
+  data: LokiQueryData;
+}
